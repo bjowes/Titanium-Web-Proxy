@@ -42,6 +42,8 @@ namespace Titanium.Web.Proxy.Network.WinAuth.Security
     {
         private static readonly byte[] header = { 0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00 };
 
+        private readonly int type;
+
         internal Message(byte[] message)
         {
             type = 3;
@@ -49,43 +51,41 @@ namespace Titanium.Web.Proxy.Network.WinAuth.Security
         }
 
         /// <summary>
-        /// Domain name
+        ///     Domain name
         /// </summary>
         internal string Domain { get; private set; }
 
         /// <summary>
-        /// Username
+        ///     Username
         /// </summary>
         internal string Username { get; private set; }
-
-        private readonly int type;
 
         internal Common.NtlmFlags Flags { get; set; }
 
         // methods
         private void Decode(byte[] message)
         {
-            //base.Decode (message);
-
             if (message == null)
-                throw new ArgumentNullException("message");
+            {
+                throw new ArgumentNullException(nameof(message));
+            }
 
             if (message.Length < 12)
             {
                 string msg = "Minimum Type3 message length is 12 bytes.";
-                throw new ArgumentOutOfRangeException("message", message.Length, msg);
+                throw new ArgumentOutOfRangeException(nameof(message), message.Length, msg);
             }
 
             if (!CheckHeader(message))
             {
                 string msg = "Invalid Type3 message header.";
-                throw new ArgumentException(msg, "message");
+                throw new ArgumentException(msg, nameof(message));
             }
 
             if (LittleEndian.ToUInt16(message, 56) != message.Length)
             {
                 string msg = "Invalid Type3 message length.";
-                throw new ArgumentException(msg, "message");
+                throw new ArgumentException(msg, nameof(message));
             }
 
             if (message.Length >= 64)
@@ -108,12 +108,13 @@ namespace Titanium.Web.Proxy.Network.WinAuth.Security
             Username = DecodeString(message, userOff, userLen);
         }
 
-        string DecodeString(byte[] buffer, int offset, int len)
+        private string DecodeString(byte[] buffer, int offset, int len)
         {
             if ((Flags & Common.NtlmFlags.NegotiateUnicode) != 0)
             {
                 return Encoding.Unicode.GetString(buffer, offset, len);
             }
+
             return Encoding.ASCII.GetString(buffer, offset, len);
         }
 
@@ -122,9 +123,12 @@ namespace Titanium.Web.Proxy.Network.WinAuth.Security
             for (int i = 0; i < header.Length; i++)
             {
                 if (message[i] != header[i])
+                {
                     return false;
+                }
             }
-            return (LittleEndian.ToUInt32(message, 8) == type);
+
+            return LittleEndian.ToUInt32(message, 8) == type;
         }
     }
 }

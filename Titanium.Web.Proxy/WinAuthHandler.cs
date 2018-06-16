@@ -3,25 +3,34 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.EventArguments;
+using Titanium.Web.Proxy.Extensions;
+using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network.WinAuth;
+using Titanium.Web.Proxy.Network.WinAuth.Security;
 
 namespace Titanium.Web.Proxy
 {
     public partial class ProxyServer
     {
-        //possible header names
-        private static readonly List<string> authHeaderNames = new List<string>
+        /// <summary>
+        ///     possible header names.
+        /// </summary>
+        private static readonly HashSet<string> authHeaderNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "WWW-Authenticate",
-            //IIS 6.0 messed up names below
+
+            // IIS 6.0 messed up names below
             "WWWAuthenticate",
             "NTLMAuthorization",
             "NegotiateAuthorization",
             "KerberosAuthorization"
         };
 
-        private static readonly List<string> authSchemes = new List<string>
+        /// <summary>
+        ///     supported authentication schemes.
+        /// </summary>
+        private static readonly HashSet<string> authSchemes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "NTLM",
             "Negotiate",
@@ -29,23 +38,22 @@ namespace Titanium.Web.Proxy
         };
 
         /// <summary>
-        /// Handle windows NTLM authentication 
-        /// Can expand this for Kerberos in future
-        /// Note: NTLM/Kerberos cannot do a man in middle operation
-        /// we do for HTTPS requests. 
-        /// As such we will be sending local credentials of current
-        /// User to server to authenticate requests. 
-        /// To disable this set ProxyServer.EnableWinAuth to false
+        ///     Handle windows NTLM/Kerberos authentication.
+        ///     Note: NTLM/Kerberos cannot do a man in middle operation
+        ///     we do for HTTPS requests.
+        ///     As such we will be sending local credentials of current
+        ///     User to server to authenticate requests.
+        ///     To disable this set ProxyServer.EnableWinAuth to false.
         /// </summary>
-        internal async Task<bool> Handle401UnAuthorized(SessionEventArgs args)
+        internal async Task Handle401UnAuthorized(SessionEventArgs args)
         {
             string headerName = null;
             HttpHeader authHeader = null;
 
-            //check in non-unique headers first
-            var header =
-                args.WebSession.Response.Headers.NonUniqueHeaders.FirstOrDefault(
-                    x => authHeaderNames.Any(y => x.Key.Equals(y, StringComparison.OrdinalIgnoreCase)));
+            var response = args.WebSession.Response;
+
+            // check in non-unique headers first
+            var header = response.Headers.NonUniqueHeaders.FirstOrDefault(x => authHeaderNames.Contains(x.Key));
 
             if (!header.Equals(new KeyValuePair<string, List<HttpHeader>>()))
             {
@@ -54,16 +62,18 @@ namespace Titanium.Web.Proxy
 
             if (headerName != null)
             {
-                authHeader = args.WebSession.Response.Headers.NonUniqueHeaders[headerName]
-                    .FirstOrDefault(x => authSchemes.Any(y => x.Value.StartsWith(y, StringComparison.OrdinalIgnoreCase)));
+                authHeader = response.Headers.NonUniqueHeaders[headerName]
+                    .FirstOrDefault(
+                        x => authSchemes.Any(y => x.Value.StartsWith(y, StringComparison.OrdinalIgnoreCase)));
             }
 
-            //check in unique headers
+            // check in unique headers
             if (authHeader == null)
             {
-                //check in non-unique headers first
-                var uHeader =
-                    args.WebSession.Response.Headers.Headers.FirstOrDefault(x => authHeaderNames.Any(y => x.Key.Equals(y, StringComparison.OrdinalIgnoreCase)));
+                headerName = null;
+
+                // check in non-unique headers first
+                var uHeader = response.Headers.Headers.FirstOrDefault(x => authHeaderNames.Contains(x.Key));
 
                 if (!uHeader.Equals(new KeyValuePair<string, HttpHeader>()))
                 {
@@ -72,79 +82,122 @@ namespace Titanium.Web.Proxy
 
                 if (headerName != null)
                 {
-                    authHeader = authSchemes.Any(x => args.WebSession.Response.Headers.Headers[headerName].Value
+                    authHeader = authSchemes.Any(x => response.Headers.Headers[headerName].Value
                         .StartsWith(x, StringComparison.OrdinalIgnoreCase))
-                        ? args.WebSession.Response.Headers.Headers[headerName]
+                        ? response.Headers.Headers[headerName]
                         : null;
                 }
             }
 
             if (authHeader != null)
             {
-                string scheme = authSchemes.FirstOrDefault(x => authHeader.Value.Equals(x, StringComparison.OrdinalIgnoreCase));
+                string scheme = authSchemes.Contains(authHeader.Value) ? authHeader.Value : null;
 
-                //clear any existing headers to avoid confusing bad servers
-                if (args.WebSession.Request.Headers.NonUniqueHeaders.ContainsKey("Authorization"))
+                var expectedAuthState =
+                    scheme == null ? State.WinAuthState.INITIAL_TOKEN : State.WinAuthState.UNAUTHORIZED;
+
+                if (!WinAuthEndPoint.ValidateWinAuthState(args.WebSession.Data, expectedAuthState))
                 {
-                    args.WebSession.Request.Headers.NonUniqueHeaders.Remove("Authorization");
+                    // Invalid state, create proper error message to client
+                    await RewriteUnauthorizedResponse(args);
+                    return;
                 }
 
-                //initial value will match exactly any of the schemes
+                var request = args.WebSession.Request;
+
+                // clear any existing headers to avoid confusing bad servers
+                request.Headers.RemoveHeader(KnownHeaders.Authorization);
+
+                // initial value will match exactly any of the schemes
                 if (scheme != null)
                 {
-                    string clientToken = WinAuthHandler.GetInitialAuthToken(args.WebSession.Request.Host, scheme, args.Id);
+                    string clientToken = WinAuthHandler.GetInitialAuthToken(request.Host, scheme, args.WebSession.Data);
 
-                    var auth = new HttpHeader("Authorization", string.Concat(scheme, clientToken));
+                    string auth = string.Concat(scheme, clientToken);
 
-                    //replace existing authorization header if any
-                    if (args.WebSession.Request.Headers.Headers.ContainsKey("Authorization"))
-                    {
-                        args.WebSession.Request.Headers.Headers["Authorization"] = auth;
-                    }
-                    else
-                    {
-                        args.WebSession.Request.Headers.Headers.Add("Authorization", auth);
-                    }
+                    // replace existing authorization header if any
+                    request.Headers.SetOrAddHeaderValue(KnownHeaders.Authorization, auth);
 
-                    //don't need to send body for Authorization request
-                    if (args.WebSession.Request.HasBody)
+                    // don't need to send body for Authorization request
+                    if (request.HasBody)
                     {
-                        args.WebSession.Request.ContentLength = 0;
+                        request.ContentLength = 0;
                     }
                 }
-                //challenge value will start with any of the scheme selected
                 else
                 {
-                    scheme = authSchemes.FirstOrDefault(x => authHeader.Value.StartsWith(x, StringComparison.OrdinalIgnoreCase) &&
-                                                             authHeader.Value.Length > x.Length + 1);
+                    // challenge value will start with any of the scheme selected
+
+                    scheme = authSchemes.First(x =>
+                        authHeader.Value.StartsWith(x, StringComparison.OrdinalIgnoreCase) &&
+                        authHeader.Value.Length > x.Length + 1);
 
                     string serverToken = authHeader.Value.Substring(scheme.Length + 1);
-                    string clientToken = WinAuthHandler.GetFinalAuthToken(args.WebSession.Request.Host, serverToken, args.Id);
+                    string clientToken = WinAuthHandler.GetFinalAuthToken(request.Host, serverToken, args.WebSession.Data);
 
-                    //there will be an existing header from initial client request 
-                    args.WebSession.Request.Headers.Headers["Authorization"] = new HttpHeader("Authorization", string.Concat(scheme, clientToken));
+                    string auth = string.Concat(scheme, clientToken);
 
-                    //send body for final auth request
-                    if (args.WebSession.Request.HasBody)
+                    // there will be an existing header from initial client request 
+                    request.Headers.SetOrAddHeaderValue(KnownHeaders.Authorization, auth);
+
+                    // send body for final auth request
+                    if (request.OriginalHasBody)
                     {
-                        args.WebSession.Request.ContentLength = args.WebSession.Request.Body.Length;
+                        request.ContentLength = request.Body.Length;
                     }
                 }
 
-                //Need to revisit this.
-                //Should we cache all Set-Cokiee headers from server during auth process
-                //and send it to client after auth?
+                // Need to revisit this.
+                // Should we cache all Set-Cokiee headers from server during auth process
+                // and send it to client after auth?
 
-                //clear current server response
-                await args.ClearResponse();
+                // Let ResponseHandler send the updated request
+                args.ReRequest = true;
+            }
+        }
 
-                //request again with updated authorization header
-                //and server cookies
-                bool disposed = await HandleHttpSessionRequestInternal(args.WebSession.ServerConnection, args, false);
-                return disposed;
+        /// <summary>
+        ///     Rewrites the response body for failed authentication
+        /// </summary>
+        /// <param name="args"></param>
+        /// <returns></returns>
+        internal async Task RewriteUnauthorizedResponse(SessionEventArgs args)
+        {
+            var response = args.WebSession.Response;
+
+            // Strip authentication headers to avoid credentials prompt in client web browser
+            foreach (string authHeaderName in authHeaderNames)
+            {
+                response.Headers.RemoveHeader(authHeaderName);
             }
 
-            return false;
+            // Add custom div to body to clarify that the proxy (not the client browser) failed authentication
+            string authErrorMessage =
+                "<div class=\"inserted-by-proxy\"><h2>NTLM authentication through Titanium.Web.Proxy (" +
+                args.ProxyClient.ClientConnection.LocalEndPoint +
+                ") failed. Please check credentials.</h2></div>";
+            string originalErrorMessage =
+                "<div class=\"inserted-by-proxy\"><h3>Response from remote web server below.</h3></div><br/>";
+            string body = await args.GetResponseBodyAsString(args.CancellationTokenSource.Token);
+            int idx = body.IndexOfIgnoreCase("<body>");
+            if (idx >= 0)
+            {
+                int bodyPos = idx + "<body>".Length;
+                body = body.Insert(bodyPos, authErrorMessage + originalErrorMessage);
+            }
+            else
+            {
+                // Cannot parse response body, replace it
+                body =
+                    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">" +
+                    "<html xmlns=\"http://www.w3.org/1999/xhtml\">" +
+                    "<body>" +
+                    authErrorMessage +
+                    "</body>" +
+                    "</html>";
+            }
+
+            args.SetResponseBodyString(body);
         }
     }
 }

@@ -1,4 +1,3 @@
-﻿using StreamExtended.Network;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -8,6 +7,7 @@ using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
+using StreamExtended.Network;
 using Titanium.Web.Proxy.EventArguments;
 using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.Helpers;
@@ -19,292 +19,83 @@ using Titanium.Web.Proxy.Network.WinAuth.Security;
 
 namespace Titanium.Web.Proxy
 {
+    /// <inheritdoc />
     /// <summary>
-    ///     Proxy Server Main class
+    ///     This class is the backbone of proxy. One can create as many instances as needed.
+    ///     However care should be taken to avoid using the same listening ports across multiple instances.
     /// </summary>
     public partial class ProxyServer : IDisposable
     {
+        /// <summary>
+        ///     HTTP &amp; HTTPS scheme shorthands.
+        /// </summary>
         internal static readonly string UriSchemeHttp = Uri.UriSchemeHttp;
         internal static readonly string UriSchemeHttps = Uri.UriSchemeHttps;
 
         /// <summary>
-        /// An default exception log func
+        ///     A default exception log func.
         /// </summary>
-        private readonly Lazy<Action<Exception>> defaultExceptionFunc = new Lazy<Action<Exception>>(() => (e => { }));
+        private readonly ExceptionHandler defaultExceptionFunc = e => { };
 
         /// <summary>
-        /// backing exception func for exposed public property
-        /// </summary>
-        private Action<Exception> exceptionFunc;
-
-        /// <summary>
-        /// Backing field for corresponding public property
-        /// </summary>
-        private bool trustRootCertificate;
-
-        /// <summary>
-        /// Backing field for corresponding public property
+        ///     Backing field for exposed public property.
         /// </summary>
         private int clientConnectionCount;
 
         /// <summary>
-        /// Backing field for corresponding public property
+        ///     Backing field for exposed public property.
+        /// </summary>
+        private ExceptionHandler exceptionFunc;
+
+        /// <summary>
+        ///     Backing field for exposed public property.
         /// </summary>
         private int serverConnectionCount;
 
         /// <summary>
-        /// A object that creates tcp connection to server
+        ///     Upstream proxy manager.
         /// </summary>
-        private TcpConnectionFactory tcpConnectionFactory { get; }
-
         private WinHttpWebProxyFinder systemProxyResolver;
 
+        /// <inheritdoc />
         /// <summary>
-        /// Manage system proxy settings
+        ///     Initializes a new instance of ProxyServer class with provided parameters.
         /// </summary>
-        private SystemProxyManager systemProxySettingsManager { get; }
-
-        /// <summary>
-        /// Set firefox to use default system proxy
-        /// </summary>
-        private readonly FireFoxProxySettingsManager firefoxProxySettingsManager = new FireFoxProxySettingsManager();
-
-        /// <summary>
-        /// Buffer size used throughout this proxy
-        /// </summary>
-        public int BufferSize { get; set; } = 8192;
-
-        /// <summary>
-        /// Manages certificates used by this proxy
-        /// </summary>
-        public CertificateManager CertificateManager { get; }
-
-        /// <summary>
-        /// The root certificate
-        /// </summary>
-        public X509Certificate2 RootCertificate
-        {
-            get { return CertificateManager.RootCertificate; }
-            set { CertificateManager.RootCertificate = value; }
-        }
-
-        /// <summary>
-        /// Name of the root certificate issuer 
-        /// (This is valid only when RootCertificate property is not set)
-        /// </summary>
-        public string RootCertificateIssuerName
-        {
-            get { return CertificateManager.Issuer; }
-            set { CertificateManager.Issuer = value; }
-        }
-
-        /// <summary>
-        /// Name of the root certificate
-        /// (This is valid only when RootCertificate property is not set)
-        /// If no certificate is provided then a default Root Certificate will be created and used
-        /// The provided root certificate will be stored in proxy exe directory with the private key 
-        /// Root certificate file will be named as "rootCert.pfx"
-        /// </summary>
-        public string RootCertificateName
-        {
-            get { return CertificateManager.RootCertificateName; }
-            set { CertificateManager.RootCertificateName = value; }
-        }
-
-        /// <summary>
-        /// Trust the RootCertificate used by this proxy server
-        /// Note that this do not make the client trust the certificate!
-        /// This would import the root certificate to the certificate store of machine that runs this proxy server
-        /// </summary>
-        public bool TrustRootCertificate
-        {
-            get { return trustRootCertificate; }
-            set
-            {
-                trustRootCertificate = value;
-                if (value)
-                {
-                    EnsureRootCertificate();
-                }
-            }
-        }
-
-        /// <summary>
-        /// Select Certificate Engine 
-        /// Optionally set to BouncyCastle
-        /// Mono only support BouncyCastle and it is the default
-        /// </summary>
-        public CertificateEngine CertificateEngine
-        {
-            get { return CertificateManager.Engine; }
-            set { CertificateManager.Engine = value; }
-        }
-
-        /// <summary>
-        /// Should we check for certificare revocation during SSL authentication to servers
-        /// Note: If enabled can reduce performance (Default disabled)
-        /// </summary>
-        public bool CheckCertificateRevocation { get; set; }
-
-        /// <summary>
-        /// Does this proxy uses the HTTP protocol 100 continue behaviour strictly?
-        /// Broken 100 contunue implementations on server/client may cause problems if enabled
-        /// </summary>
-        public bool Enable100ContinueBehaviour { get; set; }
-
-        /// <summary>
-        /// Minutes certificates should be kept in cache when not used
-        /// </summary>
-        public int CertificateCacheTimeOutMinutes { get; set; }
-
-        /// <summary>
-        /// Seconds client/server connection are to be kept alive when waiting for read/write to complete
-        /// </summary>
-        public int ConnectionTimeOutSeconds { get; set; }
-
-        /// <summary>
-        /// Intercept request to server
-        /// </summary>
-        public event Func<object, SessionEventArgs, Task> BeforeRequest;
-
-        /// <summary>
-        /// Intercept response from server
-        /// </summary>
-        public event Func<object, SessionEventArgs, Task> BeforeResponse;
-
-        /// <summary>
-        /// Intercept tunnel connect reques
-        /// </summary>
-        public event Func<object, TunnelConnectSessionEventArgs, Task> TunnelConnectRequest;
-
-        /// <summary>
-        /// Intercept tunnel connect response
-        /// </summary>
-        public event Func<object, TunnelConnectSessionEventArgs, Task> TunnelConnectResponse;
-
-        /// <summary>
-        /// Occurs when client connection count changed.
-        /// </summary>
-        public event EventHandler ClientConnectionCountChanged;
-
-        /// <summary>
-        /// Occurs when server connection count changed.
-        /// </summary>
-        public event EventHandler ServerConnectionCountChanged;
-
-        /// <summary>
-        /// External proxy for Http
-        /// </summary>
-        public ExternalProxy UpStreamHttpProxy { get; set; }
-
-        /// <summary>
-        /// External proxy for Http
-        /// </summary>
-        public ExternalProxy UpStreamHttpsProxy { get; set; }
-
-        /// <summary>
-        /// Local adapter/NIC endpoint (where proxy makes request via)
-        /// default via any IP addresses of this machine
-        /// </summary>
-        public IPEndPoint UpStreamEndPoint { get; set; } = new IPEndPoint(IPAddress.Any, 0);
-
-        /// <summary>
-        /// Is the proxy currently running
-        /// </summary>
-        public bool ProxyRunning { get; private set; }
-
-        /// <summary>
-        /// Gets or sets a value indicating whether requests will be chained to upstream gateway.
-        /// </summary>
-        public bool ForwardToUpstreamGateway { get; set; }
-
-        /// <summary>
-        /// Enable disable Windows Authentication (NTLM/Kerberos)
-        /// Note: NTLM/Kerberos will always send local credentials of current user
-        /// who is running the proxy process. This is because a man
-        /// in middle attack is not currently supported
-        /// (which would require windows delegation enabled for this server process)
-        /// </summary>
-        public bool EnableWinAuth { get; set; }
-
-        /// <summary>
-        /// Verifies the remote Secure Sockets Layer (SSL) certificate used for authentication
-        /// </summary>
-        public event Func<object, CertificateValidationEventArgs, Task> ServerCertificateValidationCallback;
-
-        /// <summary>
-        /// Callback tooverride client certificate during SSL mutual authentication
-        /// </summary>
-        public event Func<object, CertificateSelectionEventArgs, Task> ClientCertificateSelectionCallback;
-
-        /// <summary>
-        /// Callback for error events in proxy
-        /// </summary>
-        public Action<Exception> ExceptionFunc
-        {
-            get { return exceptionFunc ?? defaultExceptionFunc.Value; }
-            set { exceptionFunc = value; }
-        }
-
-        /// <summary>
-        /// A callback to authenticate clients 
-        /// Parameters are username, password provided by client
-        /// return true for successful authentication
-        /// </summary>
-        public Func<string, string, Task<bool>> AuthenticateUserFunc { get; set; }
-
-        /// <summary>
-        /// Realm used during Proxy Basic Authentication 
-        /// </summary>
-        public string ProxyRealm { get; set; } = "TitaniumProxy";
-
-        /// <summary>
-        /// A callback to provide authentication credentials for up stream proxy this proxy is using for HTTP(S) requests
-        /// return the ExternalProxy object with valid credentials
-        /// </summary>
-        public Func<SessionEventArgs, Task<ExternalProxy>> GetCustomUpStreamProxyFunc { get; set; }
-
-        /// <summary>
-        /// A list of IpAddress and port this proxy is listening to
-        /// </summary>
-        public List<ProxyEndPoint> ProxyEndPoints { get; set; }
-
-        /// <summary>
-        /// List of supported Ssl versions
-        /// </summary>
-        public SslProtocols SupportedSslProtocols { get; set; } =
-#if NET45
-            SslProtocols.Ssl3 |
-#endif
-            SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12;
-
-        /// <summary>
-        /// Total number of active client connections
-        /// </summary>
-        public int ClientConnectionCount => clientConnectionCount;
-
-        /// <summary>
-        /// Total number of active server connections
-        /// </summary>
-        public int ServerConnectionCount => serverConnectionCount;
-
-        /// <summary>
-        /// Constructor
-        /// </summary>
-        public ProxyServer() : this(null, null)
+        /// <param name="userTrustRootCertificate">
+        ///     Should fake HTTPS certificate be trusted by this machine's user certificate
+        ///     store?
+        /// </param>
+        /// <param name="machineTrustRootCertificate">Should fake HTTPS certificate be trusted by this machine's certificate store?</param>
+        /// <param name="trustRootCertificateAsAdmin">
+        ///     Should we attempt to trust certificates with elevated permissions by
+        ///     prompting for UAC if required?
+        /// </param>
+        public ProxyServer(bool userTrustRootCertificate = true, bool machineTrustRootCertificate = false,
+            bool trustRootCertificateAsAdmin = false) : this(null, null, userTrustRootCertificate,
+            machineTrustRootCertificate, trustRootCertificateAsAdmin)
         {
         }
 
         /// <summary>
-        /// Constructor.
+        ///     Initializes a new instance of ProxyServer class with provided parameters.
         /// </summary>
-        /// <param name="rootCertificateName">Name of root certificate.</param>
-        /// <param name="rootCertificateIssuerName">Name of root certificate issuer.</param>
-        public ProxyServer(string rootCertificateName, string rootCertificateIssuerName)
+        /// <param name="rootCertificateName">Name of the root certificate.</param>
+        /// <param name="rootCertificateIssuerName">Name of the root certificate issuer.</param>
+        /// <param name="userTrustRootCertificate">
+        ///     Should fake HTTPS certificate be trusted by this machine's user certificate
+        ///     store?
+        /// </param>
+        /// <param name="machineTrustRootCertificate">Should fake HTTPS certificate be trusted by this machine's certificate store?</param>
+        /// <param name="trustRootCertificateAsAdmin">
+        ///     Should we attempt to trust certificates with elevated permissions by
+        ///     prompting for UAC if required?
+        /// </param>
+        public ProxyServer(string rootCertificateName, string rootCertificateIssuerName,
+            bool userTrustRootCertificate = true, bool machineTrustRootCertificate = false,
+            bool trustRootCertificateAsAdmin = false)
         {
-            //default values
-            ConnectionTimeOutSeconds = 30;
-            CertificateCacheTimeOutMinutes = 60;
+            // default values
+            ConnectionTimeOutSeconds = 60;
 
             ProxyEndPoints = new List<ProxyEndPoint>();
             tcpConnectionFactory = new TcpConnectionFactory();
@@ -313,25 +104,189 @@ namespace Titanium.Web.Proxy
                 systemProxySettingsManager = new SystemProxyManager();
             }
 
-            CertificateManager = new CertificateManager(ExceptionFunc);
-            if (rootCertificateName != null)
-            {
-                RootCertificateName = rootCertificateName;
-            }
-
-            if (rootCertificateIssuerName != null)
-            {
-                RootCertificateIssuerName = rootCertificateIssuerName;
-            }
+            CertificateManager = new CertificateManager(rootCertificateName, rootCertificateIssuerName,
+                userTrustRootCertificate, machineTrustRootCertificate, trustRootCertificateAsAdmin, ExceptionFunc);
         }
 
         /// <summary>
-        /// Add a proxy end point
+        ///     An factory that creates tcp connection to server.
         /// </summary>
-        /// <param name="endPoint"></param>
+        private TcpConnectionFactory tcpConnectionFactory { get; }
+
+        /// <summary>
+        ///     Manage system proxy settings.
+        /// </summary>
+        private SystemProxyManager systemProxySettingsManager { get; }
+
+        /// <summary>
+        ///     Is the proxy currently running?
+        /// </summary>
+        public bool ProxyRunning { get; private set; }
+
+        /// <summary>
+        ///     Gets or sets a value indicating whether requests will be chained to upstream gateway.
+        /// </summary>
+        public bool ForwardToUpstreamGateway { get; set; }
+
+        /// <summary>
+        ///     Enable disable Windows Authentication (NTLM/Kerberos).
+        ///     Note: NTLM/Kerberos will always send local credentials of current user
+        ///     running the proxy process. This is because a man
+        ///     in middle attack with Windows domain authentication is not currently supported.
+        /// </summary>
+        public bool EnableWinAuth { get; set; }
+
+        /// <summary>
+        ///     Should we check for certificare revocation during SSL authentication to servers
+        ///     Note: If enabled can reduce performance. Defaults to false.
+        /// </summary>
+        public X509RevocationMode CheckCertificateRevocation { get; set; }
+
+        /// <summary>
+        ///     Does this proxy uses the HTTP protocol 100 continue behaviour strictly?
+        ///     Broken 100 contunue implementations on server/client may cause problems if enabled.
+        ///     Defaults to false.
+        /// </summary>
+        public bool Enable100ContinueBehaviour { get; set; }
+
+        /// <summary>
+        ///     Buffer size used throughout this proxy.
+        /// </summary>
+        public int BufferSize { get; set; } = 8192;
+
+        /// <summary>
+        ///     Seconds client/server connection are to be kept alive when waiting for read/write to complete.
+        /// </summary>
+        public int ConnectionTimeOutSeconds { get; set; }
+
+        /// <summary>
+        ///     Total number of active client connections.
+        /// </summary>
+        public int ClientConnectionCount => clientConnectionCount;
+
+        /// <summary>
+        ///     Total number of active server connections.
+        /// </summary>
+        public int ServerConnectionCount => serverConnectionCount;
+
+        /// <summary>
+        ///     Realm used during Proxy Basic Authentication.
+        /// </summary>
+        public string ProxyRealm { get; set; } = "TitaniumProxy";
+        
+        /// <summary>
+        ///     List of supported Ssl versions.
+        /// </summary>
+        public SslProtocols SupportedSslProtocols { get; set; } =
+#if NET45
+            SslProtocols.Ssl3 |
+#endif
+            SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12;
+
+        /// <summary>
+        ///     Manages certificates used by this proxy.
+        /// </summary>
+        public CertificateManager CertificateManager { get; }
+
+        /// <summary>
+        ///     External proxy used for Http requests.
+        /// </summary>
+        public ExternalProxy UpStreamHttpProxy { get; set; }
+
+        /// <summary>
+        ///     External proxy used for Https requests.
+        /// </summary>
+        public ExternalProxy UpStreamHttpsProxy { get; set; }
+
+        /// <summary>
+        ///     Local adapter/NIC endpoint where proxy makes request via.
+        ///     Defaults via any IP addresses of this machine.
+        /// </summary>
+        public IPEndPoint UpStreamEndPoint { get; set; } = new IPEndPoint(IPAddress.Any, 0);
+
+        /// <summary>
+        ///     A list of IpAddress and port this proxy is listening to.
+        /// </summary>
+        public List<ProxyEndPoint> ProxyEndPoints { get; set; }
+
+        /// <summary>
+        ///     A callback to provide authentication credentials for up stream proxy this proxy is using for HTTP(S) requests.
+        ///     User should return the ExternalProxy object with valid credentials.
+        /// </summary>
+        public Func<SessionEventArgsBase, Task<ExternalProxy>> GetCustomUpStreamProxyFunc { get; set; }
+
+        /// <summary>
+        ///     Callback for error events in this proxy instance.
+        /// </summary>
+        public ExceptionHandler ExceptionFunc
+        {
+            get => exceptionFunc ?? defaultExceptionFunc;
+            set => exceptionFunc = value;
+        }
+
+        /// <summary>
+        ///     A callback to authenticate clients.
+        ///     Parameters are username and password as provided by client.
+        ///     Should return true for successful authentication.
+        /// </summary>
+        public Func<string, string, Task<bool>> AuthenticateUserFunc { get; set; }
+
+        /// <summary>
+        ///     Dispose the Proxy instance.
+        /// </summary>
+        public void Dispose()
+        {
+            if (ProxyRunning)
+            {
+                Stop();
+            }
+
+            CertificateManager?.Dispose();
+        }
+
+        /// <summary>
+        ///     Event occurs when client connection count changed.
+        /// </summary>
+        public event EventHandler ClientConnectionCountChanged;
+
+        /// <summary>
+        ///     Event occurs when server connection count changed.
+        /// </summary>
+        public event EventHandler ServerConnectionCountChanged;
+
+        /// <summary>
+        ///     Event to override the default verification logic of remote SSL certificate received during authentication.
+        /// </summary>
+        public event AsyncEventHandler<CertificateValidationEventArgs> ServerCertificateValidationCallback;
+
+        /// <summary>
+        ///     Event to override client certificate selection during mutual SSL authentication.
+        /// </summary>
+        public event AsyncEventHandler<CertificateSelectionEventArgs> ClientCertificateSelectionCallback;
+
+        /// <summary>
+        ///     Intercept request event to server.
+        /// </summary>
+        public event AsyncEventHandler<SessionEventArgs> BeforeRequest;
+
+        /// <summary>
+        ///     Intercept response event from server.
+        /// </summary>
+        public event AsyncEventHandler<SessionEventArgs> BeforeResponse;
+
+        /// <summary>
+        ///     Intercept after response event from server.
+        /// </summary>
+        public event AsyncEventHandler<SessionEventArgs> AfterResponse;
+
+        /// <summary>
+        ///     Add a proxy end point.
+        /// </summary>
+        /// <param name="endPoint">The proxy endpoint.</param>
         public void AddEndPoint(ProxyEndPoint endPoint)
         {
-            if (ProxyEndPoints.Any(x => x.IpAddress.Equals(endPoint.IpAddress) && endPoint.Port != 0 && x.Port == endPoint.Port))
+            if (ProxyEndPoints.Any(x =>
+                x.IpAddress.Equals(endPoint.IpAddress) && endPoint.Port != 0 && x.Port == endPoint.Port))
             {
                 throw new Exception("Cannot add another endpoint to same port & ip address");
             }
@@ -345,10 +300,10 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        /// Remove a proxy end point
-        /// Will throw error if the end point does'nt exist 
+        ///     Remove a proxy end point.
+        ///     Will throw error if the end point does'nt exist.
         /// </summary>
-        /// <param name="endPoint"></param>
+        /// <param name="endPoint">The existing endpoint to remove.</param>
         public void RemoveEndPoint(ProxyEndPoint endPoint)
         {
             if (ProxyEndPoints.Contains(endPoint) == false)
@@ -365,29 +320,28 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        /// Set the given explicit end point as the default proxy server for current machine
+        ///     Set the given explicit end point as the default proxy server for current machine.
         /// </summary>
-        /// <param name="endPoint"></param>
+        /// <param name="endPoint">The explicit endpoint.</param>
         public void SetAsSystemHttpProxy(ExplicitProxyEndPoint endPoint)
         {
             SetAsSystemProxy(endPoint, ProxyProtocolType.Http);
         }
 
-
         /// <summary>
-        /// Set the given explicit end point as the default proxy server for current machine
+        ///     Set the given explicit end point as the default proxy server for current machine.
         /// </summary>
-        /// <param name="endPoint"></param>
+        /// <param name="endPoint">The explicit endpoint.</param>
         public void SetAsSystemHttpsProxy(ExplicitProxyEndPoint endPoint)
         {
             SetAsSystemProxy(endPoint, ProxyProtocolType.Https);
         }
 
         /// <summary>
-        /// Set the given explicit end point as the default proxy server for current machine
+        ///     Set the given explicit end point as the default proxy server for current machine.
         /// </summary>
-        /// <param name="endPoint"></param>
-        /// <param name="protocolType"></param>
+        /// <param name="endPoint">The explicit endpoint.</param>
+        /// <param name="protocolType">The proxy protocol type.</param>
         public void SetAsSystemProxy(ExplicitProxyEndPoint endPoint, ProxyProtocolType protocolType)
         {
             if (RunTime.IsRunningOnMono)
@@ -402,14 +356,9 @@ namespace Titanium.Web.Proxy
 
             if (isHttps)
             {
-                if (!endPoint.EnableSsl)
-                {
-                    throw new Exception("Endpoint do not support Https connections");
-                }
+                CertificateManager.EnsureRootCertificate();
 
-                EnsureRootCertificate();
-
-                //If certificate was trusted by the machine
+                // If certificate was trusted by the machine
                 if (!CertificateManager.CertValidated)
                 {
                     protocolType = protocolType & ~ProxyProtocolType.Https;
@@ -417,7 +366,7 @@ namespace Titanium.Web.Proxy
                 }
             }
 
-            //clear any settings previously added
+            // clear any settings previously added
             if (isHttp)
             {
                 ProxyEndPoints.OfType<ExplicitProxyEndPoint>().ToList().ForEach(x => x.IsSystemHttpProxy = false);
@@ -438,15 +387,13 @@ namespace Titanium.Web.Proxy
 
             if (isHttp)
             {
-                endPoint.IsSystemHttpsProxy = true;
+                endPoint.IsSystemHttpProxy = true;
             }
 
             if (isHttps)
             {
                 endPoint.IsSystemHttpsProxy = true;
             }
-
-            firefoxProxySettingsManager.UseSystemProxy();
 
             string proxyType = null;
             switch (protocolType)
@@ -464,12 +411,13 @@ namespace Titanium.Web.Proxy
 
             if (protocolType != ProxyProtocolType.None)
             {
-                Console.WriteLine("Set endpoint at Ip {0} and port: {1} as System {2} Proxy", endPoint.IpAddress, endPoint.Port, proxyType);
+                Console.WriteLine("Set endpoint at Ip {0} and port: {1} as System {2} Proxy", endPoint.IpAddress,
+                    endPoint.Port, proxyType);
             }
         }
 
         /// <summary>
-        /// Remove any HTTP proxy setting of current machien
+        ///     Clear HTTP proxy settings of current machine.
         /// </summary>
         public void DisableSystemHttpProxy()
         {
@@ -477,7 +425,7 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        /// Remove any HTTPS proxy setting for current machine
+        ///     Clear HTTPS proxy settings of current machine.
         /// </summary>
         public void DisableSystemHttpsProxy()
         {
@@ -485,7 +433,7 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        /// Remove the specified proxy settings for current machine
+        ///     Clear the specified proxy setting for current machine.
         /// </summary>
         public void DisableSystemProxy(ProxyProtocolType protocolType)
         {
@@ -498,7 +446,7 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        /// Clear all proxy settings for current machine
+        ///     Clear all proxy settings for current machine.
         /// </summary>
         public void DisableAllSystemProxies()
         {
@@ -511,7 +459,7 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        /// Start this proxy server
+        ///     Start this proxy server instance.
         /// </summary>
         public void Start()
         {
@@ -520,8 +468,13 @@ namespace Titanium.Web.Proxy
                 throw new Exception("Proxy is already running.");
             }
 
-            //clear any system proxy settings which is pointing to our own endpoint (causing a cycle)
-            //due to non gracious proxy shutdown before or something else
+            if (ProxyEndPoints.OfType<ExplicitProxyEndPoint>().Any(x => x.GenericCertificate == null))
+            {
+                CertificateManager.EnsureRootCertificate();
+            }
+
+            // clear any system proxy settings which is pointing to our own endpoint (causing a cycle)
+            // due to ungracious proxy shutdown before or something else
             if (systemProxySettingsManager != null && RunTime.IsWindows)
             {
                 var proxyInfo = systemProxySettingsManager.GetProxyInfoFromRegistry();
@@ -531,7 +484,7 @@ namespace Titanium.Web.Proxy
                     foreach (var proxy in proxyInfo.Proxies.Values)
                     {
                         if ((proxy.HostName == "127.0.0.1"
-                            || proxy.HostName.Equals("localhost", StringComparison.OrdinalIgnoreCase))
+                             || proxy.HostName.EqualsIgnoreCase("localhost"))
                             && ProxyEndPoints.Any(x => x.Port == proxy.Port))
                         {
                             protocolToRemove |= proxy.ProtocolType;
@@ -540,7 +493,6 @@ namespace Titanium.Web.Proxy
 
                     if (protocolToRemove != ProxyProtocolType.None)
                     {
-                        //do not restore to any of listening address when we quit
                         systemProxySettingsManager.RemoveProxy(protocolToRemove, false);
                     }
                 }
@@ -557,23 +509,16 @@ namespace Titanium.Web.Proxy
 
             ProxyRunning = true;
 
+            CertificateManager.ClearIdleCertificates();
+
             foreach (var endPoint in ProxyEndPoints)
             {
                 Listen(endPoint);
             }
-
-            CertificateManager.ClearIdleCertificates(CertificateCacheTimeOutMinutes);
-
-            if (RunTime.IsWindows && !RunTime.IsRunningOnMono)
-            {
-                //clear orphaned windows auth states every 2 minutes
-                WinAuthEndPoint.ClearIdleStates(2);
-            }
         }
 
-
         /// <summary>
-        /// Stop this proxy server
+        ///     Stop this proxy server instance.
         /// </summary>
         public void Stop()
         {
@@ -584,7 +529,8 @@ namespace Titanium.Web.Proxy
 
             if (!RunTime.IsRunningOnMono && RunTime.IsWindows)
             {
-                bool setAsSystemProxy = ProxyEndPoints.OfType<ExplicitProxyEndPoint>().Any(x => x.IsSystemHttpProxy || x.IsSystemHttpsProxy);
+                bool setAsSystemProxy = ProxyEndPoints.OfType<ExplicitProxyEndPoint>()
+                    .Any(x => x.IsSystemHttpProxy || x.IsSystemHttpsProxy);
 
                 if (setAsSystemProxy)
                 {
@@ -605,44 +551,9 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        ///  Handle dispose of a client/server session
+        ///     Listen on given end point of local machine.
         /// </summary>
-        /// <param name="clientStream"></param>
-        /// <param name="clientStreamReader"></param>
-        /// <param name="clientStreamWriter"></param>
-        /// <param name="serverConnection"></param>
-        private void Dispose(CustomBufferedStream clientStream, CustomBinaryReader clientStreamReader, HttpResponseWriter clientStreamWriter, TcpConnection serverConnection)
-        {
-            clientStream?.Dispose();
-
-            clientStreamReader?.Dispose();
-            clientStreamWriter?.Dispose();
-
-            if (serverConnection != null)
-            {
-                serverConnection.Dispose();
-                serverConnection = null;
-                UpdateServerConnectionCount(false);
-            }
-        }
-
-        /// <summary>
-        /// Dispose Proxy.
-        /// </summary>
-        public void Dispose()
-        {
-            if (ProxyRunning)
-            {
-                Stop();
-            }
-
-            CertificateManager?.Dispose();
-        }
-
-        /// <summary>
-        /// Listen on the given end point on local machine
-        /// </summary>
-        /// <param name="endPoint"></param>
+        /// <param name="endPoint">The end point to listen.</param>
         private void Listen(ProxyEndPoint endPoint)
         {
             endPoint.Listener = new TcpListener(endPoint.IpAddress, endPoint.Port);
@@ -657,7 +568,8 @@ namespace Titanium.Web.Proxy
             }
             catch (SocketException ex)
             {
-                var pex = new Exception($"Endpoint {endPoint} failed to start. Check inner exception and exception data for details.", ex);
+                var pex = new Exception(
+                    $"Endpoint {endPoint} failed to start. Check inner exception and exception data for details.", ex);
                 pex.Data.Add("ipAddress", endPoint.IpAddress);
                 pex.Data.Add("port", endPoint.Port);
                 throw pex;
@@ -665,13 +577,16 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        /// Verifiy if its safe to set this end point as System proxy
+        ///     Verify if its safe to set this end point as system proxy.
         /// </summary>
-        /// <param name="endPoint"></param>
+        /// <param name="endPoint">The end point to validate.</param>
         private void ValidateEndPointAsSystemProxy(ExplicitProxyEndPoint endPoint)
         {
             if (endPoint == null)
+            {
                 throw new ArgumentNullException(nameof(endPoint));
+            }
+
             if (ProxyEndPoints.Contains(endPoint) == false)
             {
                 throw new Exception("Cannot set endPoints not added to proxy as system proxy");
@@ -684,33 +599,19 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        /// Gets the system up stream proxy.
+        ///  Gets the system up stream proxy.
         /// </summary>
-        /// <param name="sessionEventArgs">The <see cref="SessionEventArgs"/> instance containing the event data.</param>
-        /// <returns><see cref="ExternalProxy"/> instance containing valid proxy configuration from PAC/WAPD scripts if any exists.</returns>
-        private Task<ExternalProxy> GetSystemUpStreamProxy(SessionEventArgs sessionEventArgs)
+        /// <param name="sessionEventArgs">The session.</param>
+        /// <returns>The external proxy as task result.</returns>
+        private Task<ExternalProxy> GetSystemUpStreamProxy(SessionEventArgsBase sessionEventArgs)
         {
             var proxy = systemProxyResolver.GetProxy(sessionEventArgs.WebSession.Request.RequestUri);
             return Task.FromResult(proxy);
         }
 
-        private void EnsureRootCertificate()
-        {
-            if (!CertificateManager.CertValidated)
-            {
-                CertificateManager.CreateTrustedRootCertificate();
-
-                if (TrustRootCertificate)
-                {
-                    CertificateManager.TrustRootCertificate();
-                }
-            }
-        }
-
         /// <summary>
-        /// When a connection is received from client act
+        ///     Act when a connection is received from client.
         /// </summary>
-        /// <param name="asyn"></param>
         private void OnAcceptConnection(IAsyncResult asyn)
         {
             var endPoint = (ProxyEndPoint)asyn.AsyncState;
@@ -719,7 +620,7 @@ namespace Titanium.Web.Proxy
 
             try
             {
-                //based on end point type call appropriate request handlers
+                // based on end point type call appropriate request handlers
                 tcpClient = endPoint.Listener.EndAcceptTcpClient(asyn);
             }
             catch (ObjectDisposedException)
@@ -731,71 +632,72 @@ namespace Titanium.Web.Proxy
             }
             catch
             {
-                //Other errors are discarded to keep proxy running
+                // Other errors are discarded to keep proxy running
             }
 
             if (tcpClient != null)
             {
-                Task.Run(async () =>
-                {
-                    await HandleClient(tcpClient, endPoint);
-                });
+                Task.Run(async () => { await HandleClient(tcpClient, endPoint); });
             }
 
             // Get the listener that handles the client request.
             endPoint.Listener.BeginAcceptTcpClient(OnAcceptConnection, endPoint);
         }
 
+        /// <summary>
+        ///     Handle the client.
+        /// </summary>
+        /// <param name="tcpClient">The client.</param>
+        /// <param name="endPoint">The proxy endpoint.</param>
+        /// <returns>The task.</returns>
         private async Task HandleClient(TcpClient tcpClient, ProxyEndPoint endPoint)
         {
-            UpdateClientConnectionCount(true);
-
             tcpClient.ReceiveTimeout = ConnectionTimeOutSeconds * 1000;
             tcpClient.SendTimeout = ConnectionTimeOutSeconds * 1000;
 
-            try
+            using (var clientConnection = new TcpClientConnection(this, tcpClient))
             {
-                if (endPoint.GetType() == typeof(TransparentProxyEndPoint))
+                if (endPoint is TransparentProxyEndPoint tep)
                 {
-                    await HandleClient(endPoint as TransparentProxyEndPoint, tcpClient);
+                    await HandleClient(tep, clientConnection);
                 }
                 else
                 {
-                    await HandleClient(endPoint as ExplicitProxyEndPoint, tcpClient);
-                }
-            }
-            finally
-            {
-                UpdateClientConnectionCount(false);
-
-                try
-                {
-                    if (tcpClient != null)
-                    {
-                        //This line is important!
-                        //contributors please don't remove it without discussion
-                        //It helps to avoid eventual deterioration of performance due to TCP port exhaustion
-                        //due to default TCP CLOSE_WAIT timeout for 4 minutes
-                        tcpClient.LingerState = new LingerOption(true, 0);
-                        tcpClient.Close();
-                    }
-                }
-                catch
-                {
+                    await HandleClient((ExplicitProxyEndPoint)endPoint, clientConnection);
                 }
             }
         }
 
         /// <summary>
-        /// Quit listening on the given end point
+        /// Handle exception.
         /// </summary>
-        /// <param name="endPoint"></param>
+        /// <param name="clientStream">The client stream.</param>
+        /// <param name="exception">The exception.</param>
+        private void OnException(CustomBufferedStream clientStream, Exception exception)
+        {
+#if DEBUG
+            if (clientStream is DebugCustomBufferedStream debugStream)
+            {
+                debugStream.LogException(exception);
+            }
+#endif
+
+            ExceptionFunc(exception);
+        }
+
+        /// <summary>
+        ///     Quit listening on the given end point.
+        /// </summary>
         private void QuitListen(ProxyEndPoint endPoint)
         {
             endPoint.Listener.Stop();
             endPoint.Listener.Server.Dispose();
         }
 
+        /// <summary>
+        ///     Update client connection count.
+        /// </summary>
+        /// <param name="increment">Should we increment/decrement?</param>
         internal void UpdateClientConnectionCount(bool increment)
         {
             if (increment)
@@ -810,6 +712,10 @@ namespace Titanium.Web.Proxy
             ClientConnectionCountChanged?.Invoke(this, EventArgs.Empty);
         }
 
+        /// <summary>
+        ///     Update server connection count.
+        /// </summary>
+        /// <param name="increment">Should we increment/decrement?</param>
         internal void UpdateServerConnectionCount(bool increment)
         {
             if (increment)

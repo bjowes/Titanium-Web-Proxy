@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Security;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.EventArguments;
+using Titanium.Web.Proxy.Exceptions;
 using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Models;
@@ -13,105 +14,97 @@ namespace Titanium.Web.Proxy.Examples.Basic
 {
     public class ProxyTestController
     {
+        private readonly object lockObj = new object();
+
         private readonly ProxyServer proxyServer;
 
-
-        //keep track of request headers
-        private readonly IDictionary<Guid, HeaderCollection> requestHeaderHistory = new ConcurrentDictionary<Guid, HeaderCollection>();
-
-        //keep track of response headers
-        private readonly IDictionary<Guid, HeaderCollection> responseHeaderHistory = new ConcurrentDictionary<Guid, HeaderCollection>();
-
-        //share requestBody outside handlers
-        //Using a dictionary is not a good idea since it can cause memory overflow
-        //ideally the data should be moved out of memory
-        //private readonly IDictionary<Guid, string> requestBodyHistory = new ConcurrentDictionary<Guid, string>();
+        private ExplicitProxyEndPoint explicitEndPoint;
 
         public ProxyTestController()
         {
             proxyServer = new ProxyServer();
 
-            //generate root certificate without storing it in file system
-            //proxyServer.CertificateEngine = Network.CertificateEngine.BouncyCastle;
-            //proxyServer.CertificateManager.CreateTrustedRootCertificate(false);
+            // generate root certificate without storing it in file system
+            //proxyServer.CertificateManager.CreateRootCertificate(false);
+
             //proxyServer.CertificateManager.TrustRootCertificate();
+            //proxyServer.CertificateManager.TrustRootCertificateAsAdmin();
 
-            proxyServer.ExceptionFunc = exception => Console.WriteLine(exception.Message);
-            proxyServer.TrustRootCertificate = true;
+            proxyServer.ExceptionFunc = exception =>
+            {
+                lock (lockObj)
+                {
+                    var color = Console.ForegroundColor;
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    if (exception is ProxyHttpException phex)
+                    {
+                        Console.WriteLine(exception.Message + ": " + phex.InnerException?.Message);
+                    }
+                    else
+                    {
+                        Console.WriteLine(exception.Message);
+                    }
+
+                    Console.ForegroundColor = color;
+                }
+            };
             proxyServer.ForwardToUpstreamGateway = true;
+            proxyServer.CertificateManager.SaveFakeCertificates = true;
+            
+            // optionally set the Certificate Engine
+            // Under Mono or Non-Windows runtimes only BouncyCastle will be supported
+            //proxyServer.CertificateManager.CertificateEngine = Network.CertificateEngine.BouncyCastle;
 
-            //optionally set the Certificate Engine
-            //Under Mono or Non-Windows runtimes only BouncyCastle will be supported
-            //proxyServer.CertificateEngine = Network.CertificateEngine.DefaultWindows;
-
-            //optionally set the Root Certificate
-            //proxyServer.RootCertificate = new X509Certificate2("myCert.pfx", string.Empty, X509KeyStorageFlags.Exportable);
+            // optionally set the Root Certificate
+            //proxyServer.CertificateManager.RootCertificate = new X509Certificate2("myCert.pfx", string.Empty, X509KeyStorageFlags.Exportable);
         }
 
         public void StartProxy()
         {
             proxyServer.BeforeRequest += OnRequest;
             proxyServer.BeforeResponse += OnResponse;
-            proxyServer.TunnelConnectRequest += OnTunnelConnectRequest;
-            proxyServer.TunnelConnectResponse += OnTunnelConnectResponse;
+
             proxyServer.ServerCertificateValidationCallback += OnCertificateValidation;
             proxyServer.ClientCertificateSelectionCallback += OnCertificateSelection;
 
             //proxyServer.EnableWinAuth = true;
 
-            var explicitEndPoint = new ExplicitProxyEndPoint(IPAddress.Any, 8000, true)
-            {
-                //Exclude Https addresses you don't want to proxy
-                //Useful for clients that use certificate pinning
-                //for example google.com and dropbox.com
-                ExcludedHttpsHostNameRegex = new List<string>
-                {
-                    "dropbox.com"
-                },
+            explicitEndPoint = new ExplicitProxyEndPoint(IPAddress.Any, 8000);
 
-                //Include Https addresses you want to proxy (others will be excluded)
-                //for example github.com
-                //IncludedHttpsHostNameRegex = new List<string>
-                //{
-                //    "github.com"
-                //},
+            // Fired when a CONNECT request is received
+            explicitEndPoint.BeforeTunnelConnectRequest += OnBeforeTunnelConnectRequest;
+            explicitEndPoint.BeforeTunnelConnectResponse += OnBeforeTunnelConnectResponse;
 
-                //You can set only one of the ExcludedHttpsHostNameRegex and IncludedHttpsHostNameRegex properties, otherwise ArgumentException will be thrown
-
-                //Use self-issued generic certificate on all https requests
-                //Optimizes performance by not creating a certificate for each https-enabled domain
-                //Useful when certificate trust is not required by proxy clients
-                //GenericCertificate = new X509Certificate2(Path.Combine(System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "genericcert.pfx"), "password")
-            };
-
-            //An explicit endpoint is where the client knows about the existence of a proxy
-            //So client sends request in a proxy friendly manner
+            // An explicit endpoint is where the client knows about the existence of a proxy
+            // So client sends request in a proxy friendly manner
             proxyServer.AddEndPoint(explicitEndPoint);
             proxyServer.Start();
 
-            //Transparent endpoint is useful for reverse proxy (client is not aware of the existence of proxy)
-            //A transparent endpoint usually requires a network router port forwarding HTTP(S) packets or DNS
-            //to send data to this endPoint
+            // Transparent endpoint is useful for reverse proxy (client is not aware of the existence of proxy)
+            // A transparent endpoint usually requires a network router port forwarding HTTP(S) packets or DNS
+            // to send data to this endPoint
             //var transparentEndPoint = new TransparentProxyEndPoint(IPAddress.Any, 443, true)
-            //{
-            //    //Generic Certificate hostname to use
-            //    //When SNI is disabled by client
+            //{ 
+            //    // Generic Certificate hostname to use
+            //    // When SNI is disabled by client
             //    GenericCertificateName = "google.com"
             //};
 
             //proxyServer.AddEndPoint(transparentEndPoint);
-
             //proxyServer.UpStreamHttpProxy = new ExternalProxy() { HostName = "localhost", Port = 8888 };
             //proxyServer.UpStreamHttpsProxy = new ExternalProxy() { HostName = "localhost", Port = 8888 };
 
             foreach (var endPoint in proxyServer.ProxyEndPoints)
-                Console.WriteLine("Listening on '{0}' endpoint at Ip {1} and port: {2} ", endPoint.GetType().Name, endPoint.IpAddress, endPoint.Port);
+            {
+                Console.WriteLine("Listening on '{0}' endpoint at Ip {1} and port: {2} ", endPoint.GetType().Name,
+                    endPoint.IpAddress, endPoint.Port);
+            }
 
 #if NETSTANDARD2_0
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 #endif
             {
-                //Only explicit proxies can be set as system proxy!
+                // Only explicit proxies can be set as system proxy!
                 //proxyServer.SetAsSystemHttpProxy(explicitEndPoint);
                 //proxyServer.SetAsSystemHttpsProxy(explicitEndPoint);
                 proxyServer.SetAsSystemProxy(explicitEndPoint, ProxyProtocolType.AllHttp);
@@ -120,112 +113,144 @@ namespace Titanium.Web.Proxy.Examples.Basic
 
         public void Stop()
         {
-            proxyServer.TunnelConnectRequest -= OnTunnelConnectRequest;
-            proxyServer.TunnelConnectResponse -= OnTunnelConnectResponse;
+            explicitEndPoint.BeforeTunnelConnectRequest -= OnBeforeTunnelConnectRequest;
+            explicitEndPoint.BeforeTunnelConnectResponse -= OnBeforeTunnelConnectResponse;
+
             proxyServer.BeforeRequest -= OnRequest;
             proxyServer.BeforeResponse -= OnResponse;
             proxyServer.ServerCertificateValidationCallback -= OnCertificateValidation;
             proxyServer.ClientCertificateSelectionCallback -= OnCertificateSelection;
 
             proxyServer.Stop();
-
-            //remove the generated certificates
+            
+            // remove the generated certificates
             //proxyServer.CertificateManager.RemoveTrustedRootCertificates();
         }
 
-        private async Task OnTunnelConnectRequest(object sender, TunnelConnectSessionEventArgs e)
+        private async Task OnBeforeTunnelConnectRequest(object sender, TunnelConnectSessionEventArgs e)
         {
-            Console.WriteLine("Tunnel to: " + e.WebSession.Request.Host);
-        }
+            string hostname = e.WebSession.Request.RequestUri.Host;
+            WriteToConsole("Tunnel to: " + hostname);
 
-        private async Task OnTunnelConnectResponse(object sender, TunnelConnectSessionEventArgs e)
-        {
-        }
-
-        //intecept & cancel redirect or update requests
-        public async Task OnRequest(object sender, SessionEventArgs e)
-        {
-            Console.WriteLine("Active Client Connections:" + ((ProxyServer)sender).ClientConnectionCount);
-            Console.WriteLine(e.WebSession.Request.Url);
-
-            //read request headers
-            requestHeaderHistory[e.Id] = e.WebSession.Request.Headers;
-
-            if (e.WebSession.Request.HasBody)
+            if (hostname.Contains("dropbox.com"))
             {
-                //Get/Set request body bytes
-                var bodyBytes = await e.GetRequestBody();
-                await e.SetRequestBody(bodyBytes);
-
-                //Get/Set request body as string
-                string bodyString = await e.GetRequestBodyAsString();
-                await e.SetRequestBodyString(bodyString);
-
-                //requestBodyHistory[e.Id] = bodyString;
+                // Exclude Https addresses you don't want to proxy
+                // Useful for clients that use certificate pinning
+                // for example dropbox.com
+                e.DecryptSsl = false;
             }
+        }
 
-            ////To cancel a request with a custom HTML content
-            ////Filter URL
-            //if (e.WebSession.Request.RequestUri.AbsoluteUri.Contains("google.com"))
+        private async Task OnBeforeTunnelConnectResponse(object sender, TunnelConnectSessionEventArgs e)
+        {
+        }
+
+        // intecept & cancel redirect or update requests
+        private async Task OnRequest(object sender, SessionEventArgs e)
+        {
+            WriteToConsole("Active Client Connections:" + ((ProxyServer)sender).ClientConnectionCount);
+            WriteToConsole(e.WebSession.Request.Url);
+
+            // store it in the UserData property
+            // It can be a simple integer, Guid, or any type
+            //e.UserData = new CustomUserData()
             //{
-            //    await e.Ok("<!DOCTYPE html>" +
+            //    RequestHeaders = e.WebSession.Request.Headers,
+            //    RequestBody = e.WebSession.Request.HasBody ? e.WebSession.Request.Body:null,
+            //    RequestBodyString = e.WebSession.Request.HasBody? e.WebSession.Request.BodyString:null
+            //};
+
+            ////This sample shows how to get the multipart form data headers
+            //if (e.WebSession.Request.Host == "mail.yahoo.com" && e.WebSession.Request.IsMultipartFormData)
+            //{
+            //    e.MultipartRequestPartSent += MultipartRequestPartSent;
+            //}
+
+            // To cancel a request with a custom HTML content
+            // Filter URL
+            //if (e.WebSession.Request.RequestUri.AbsoluteUri.Contains("yahoo.com"))
+            //{ 
+            //    e.Ok("<!DOCTYPE html>" +
             //          "<html><body><h1>" +
             //          "Website Blocked" +
             //          "</h1>" +
             //          "<p>Blocked by titanium web proxy.</p>" +
             //          "</body>" +
             //          "</html>");
-            //}
+            //} 
 
             ////Redirect example
             //if (e.WebSession.Request.RequestUri.AbsoluteUri.Contains("wikipedia.org"))
-            //{
-            //    await e.Redirect("https://www.paypal.com");
-            //}
+            //{ 
+            //   e.Redirect("https://www.paypal.com");
+            //} 
         }
 
-        //Modify response
-        public async Task OnResponse(object sender, SessionEventArgs e)
+        // Modify response
+        private void MultipartRequestPartSent(object sender, MultipartRequestPartSentEventArgs e)
         {
-            Console.WriteLine("Active Server Connections:" + ((ProxyServer)sender).ServerConnectionCount);
-
-            //if (requestBodyHistory.ContainsKey(e.Id))
-            //{
-            //    //access request body by looking up the shared dictionary using requestId
-            //    var requestBody = requestBodyHistory[e.Id];
-            //}
-
-            //read response headers
-            responseHeaderHistory[e.Id] = e.WebSession.Response.Headers;
-
-            // print out process id of current session
-            //Console.WriteLine($"PID: {e.WebSession.ProcessId.Value}");
-
-            //if (!e.ProxySession.Request.Host.Equals("medeczane.sgk.gov.tr")) return;
-            if (e.WebSession.Request.Method == "GET" || e.WebSession.Request.Method == "POST")
+            var session = (SessionEventArgs)sender;
+            WriteToConsole("Multipart form data headers:");
+            foreach (var header in e.Headers)
             {
-                if (e.WebSession.Response.StatusCode == (int)HttpStatusCode.OK)
-                {
-                    if (e.WebSession.Response.ContentType != null && e.WebSession.Response.ContentType.Trim().ToLower().Contains("text/html"))
-                    {
-                        var bodyBytes = await e.GetResponseBody();
-                        await e.SetResponseBody(bodyBytes);
-
-                        string body = await e.GetResponseBodyAsString();
-                        await e.SetResponseBodyString(body);
-                    }
-                }
+                WriteToConsole(header.ToString());
             }
         }
 
+        private async Task OnResponse(object sender, SessionEventArgs e)
+        {
+            WriteToConsole("Active Server Connections:" + ((ProxyServer)sender).ServerConnectionCount);
+
+            string ext = System.IO.Path.GetExtension(e.WebSession.Request.RequestUri.AbsolutePath);
+
+            //access user data set in request to do something with it
+            //var userData = e.WebSession.UserData as CustomUserData;
+
+            //if (ext == ".gif" || ext == ".png" || ext == ".jpg")
+            //{ 
+            //    byte[] btBody = Encoding.UTF8.GetBytes("<!DOCTYPE html>" +
+            //                                           "<html><body><h1>" +
+            //                                           "Image is blocked" +
+            //                                           "</h1>" +
+            //                                           "<p>Blocked by Titanium</p>" +
+            //                                           "</body>" +
+            //                                           "</html>");
+
+            //    var response = new OkResponse(btBody);
+            //    response.HttpVersion = e.WebSession.Request.HttpVersion;
+
+            //    e.Respond(response);
+            //    e.TerminateServerConnection();
+            //} 
+
+            //// print out process id of current session
+            ////WriteToConsole($"PID: {e.WebSession.ProcessId.Value}");
+
+            ////if (!e.ProxySession.Request.Host.Equals("medeczane.sgk.gov.tr")) return;
+            //if (e.WebSession.Request.Method == "GET" || e.WebSession.Request.Method == "POST")
+            //{ 
+            //    if (e.WebSession.Response.StatusCode == (int)HttpStatusCode.OK)
+            //    {
+            //        if (e.WebSession.Response.ContentType != null && e.WebSession.Response.ContentType.Trim().ToLower().Contains("text/html"))
+            //        {
+            //            var bodyBytes = await e.GetResponseBody();
+            //            await e.SetResponseBody(bodyBytes);
+
+            //            string body = await e.GetResponseBodyAsString();
+            //            await e.SetResponseBodyString(body);
+            //        }
+            //    }
+            //} 
+        }
+
         /// <summary>
-        /// Allows overriding default certificate validation logic
+        ///     Allows overriding default certificate validation logic
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
         public Task OnCertificateValidation(object sender, CertificateValidationEventArgs e)
         {
-            //set IsValid to true/false based on Certificate Errors
+            // set IsValid to true/false based on Certificate Errors
             if (e.SslPolicyErrors == SslPolicyErrors.None)
             {
                 e.IsValid = true;
@@ -235,15 +260,34 @@ namespace Titanium.Web.Proxy.Examples.Basic
         }
 
         /// <summary>
-        /// Allows overriding default client certificate selection logic during mutual authentication
+        ///     Allows overriding default client certificate selection logic during mutual authentication
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
         public Task OnCertificateSelection(object sender, CertificateSelectionEventArgs e)
         {
-            //set e.clientCertificate to override
+            // set e.clientCertificate to override
 
             return Task.FromResult(0);
         }
+
+        private void WriteToConsole(string message)
+        {
+            lock (lockObj)
+            {
+                Console.WriteLine(message);
+            }
+        }
+
+        ///// <summary>
+        ///// User data object as defined by user.
+        ///// User data can be set to each SessionEventArgs.WebSession.UserData property
+        ///// </summary>
+        //public class CustomUserData
+        //{
+        //    public HeaderCollection RequestHeaders { get; set; }
+        //    public byte[] RequestBody { get; set; }
+        //    public string RequestBodyString { get; set; }
+        //}
     }
 }
